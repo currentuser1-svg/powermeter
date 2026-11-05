@@ -1,0 +1,5 @@
+powermeter.db
+powermeter.db-*
+powermeter.lock
+powermeter.log*
+__pycache__/
