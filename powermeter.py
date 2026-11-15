@@ -29,6 +29,7 @@ import math
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -37,7 +38,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime
+from collections import deque
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -58,8 +60,9 @@ DEFAULT_HOSTS = [
     # «прочее» = 0, потому что железо под ней — это другой комп
     {"name": "vm-gpu",   "label": "VM-GPU", "url": "http://192.168.1.21:8085/data.json",
      "cpu": "off",  "gpu": "auto", "other_watts": 0,  "psu_eff": 0.85},
+    # GTX 660 там отключена в диспетчере устройств — LHM её не видит; включишь — поставь GPU «авто» на /hosts
     {"name": "server-2", "label": "Сервер-2",     "url": "http://192.168.1.22:8085/data.json",
-     "cpu": "auto", "gpu": "auto", "other_watts": 20, "psu_eff": 0.85},
+     "cpu": "auto", "gpu": "off",  "other_watts": 20, "psu_eff": 0.85},
 ]
 
 KINDS = ("CPU", "GPU")
@@ -69,10 +72,11 @@ POLL_SECONDS = 2            # как часто спрашивать LHM (сам
 OFFLINE_RETRY_SECONDS = 10  # если хост не отвечает — стучимся реже
 FETCH_TIMEOUT = 3.0         # сколько ждать ответа LHM
 FLUSH_SECONDS = 30          # как часто сбрасывать накопленное в базу
+HISTORY_SECONDS = 5         # шаг графика «последний час» (живёт в памяти)
 MAX_GAP_SECONDS = 30        # дыру длиннее (сон, LHM закрыт) не интерполируем — она не считается
 MAX_WATTS = 1500            # больше — глюк датчика, такое значение пропускаем
 
-WEB_HOST = "127.0.0.1"      # "0.0.0.0" — открыть страничку в локалку (на ней можно править хосты!)
+WEB_HOST = "0.0.0.0"        # страничка открыта в локалку; "127.0.0.1" — только с этого компа
 WEB_PORT = 8087             # 0 — без странички
 
 # Значения по умолчанию для новых хостов в форме на /hosts
@@ -93,6 +97,8 @@ MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май"
           "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
 MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня",
               "июля", "августа", "сентября", "октября", "ноября", "декабря")
+MONTHS_DAT = ("январю", "февралю", "марту", "апрелю", "маю", "июню",
+              "июлю", "августу", "сентябрю", "октябрю", "ноябрю", "декабрю")
 WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 N_COLORS = 8
 
@@ -361,6 +367,7 @@ class Meter:
         self.last = {}
         self.live = {}   # хост → последнее, что от него пришло
         self.cfg = []    # включённые хосты, в порядке показа
+        self.history = deque(maxlen=int(3600 / HISTORY_SECONDS) + 10)
 
     def sample(self, watts: dict, t_wall: float, t_mono: float) -> None:
         """Трапеция между прошлым и текущим замером. Вызывать под self.lock."""
@@ -411,18 +418,32 @@ class Meter:
                 miss = [k for k in KINDS if k not in off and watts.get(k) is None]
                 note = ", ".join(hw) + ("; не найден сенсор: " + ", ".join(miss) if miss else "")
             s = sum(w for w in watts.values() if w is not None)
+            hwall = None
             if state == "ok":
                 online += 1
-                wall += (s + h["other_watts"]) / (h["psu_eff"] if h["psu_eff"] > 0 else 1.0)
+                hwall = (s + h["other_watts"]) / (h["psu_eff"] if h["psu_eff"] > 0 else 1.0)
+                wall += hwall
             hosts.append({"name": h["name"], "label": h["label"], "state": state, "note": note,
                           "watts": {k: watts.get(k) for k in KINDS}, "off": off, "sum": s,
-                          "sensors": sensors})
+                          "wall": hwall, "sensors": sensors})
         if not cfg:
             text = "хостов нет — добавь на странице «Хосты»"
         else:
             text = f"Сейчас ≈ {num(wall, 0)} Вт от розетки · на связи {online} из {len(cfg)}"
         return {"ts": now, "kinds": list(KINDS), "hosts": hosts, "wall_w": wall,
-                "online": online, "text": text}
+                "online": online, "text": text,
+                "labels": {h["name"]: h["label"] for h in cfg}}
+
+    def record(self) -> None:
+        """Точка для графика «последний час»: CPU+GPU каждого хоста, который на связи."""
+        snap = self.snapshot()
+        point = {h["name"]: round(h["sum"], 1) for h in snap["hosts"] if h["state"] == "ok"}
+        with self.lock:
+            self.history.append((round(snap["ts"], 1), point))
+
+    def history_since(self, ts: float) -> list:
+        with self.lock:
+            return [p for p in self.history if p[0] > ts]
 
 
 def flush(db: sqlite3.Connection, meter: Meter) -> bool:
@@ -526,6 +547,8 @@ def month_report(db, y: int, m: int, now: float = None) -> dict:
            "hsecs": [mg["hs"].get(s["name"], 0.0) for s in series],
            "kind_wh": [{kind_of(ch): v for ch, v in mg["wh"].items() if host_of(ch) == s["name"]}
                        for s in series],
+           "hwall": [wall_kwh({"wh": {c: v for c, v in mg["wh"].items() if host_of(c) == s["name"]},
+                               "hs": {s["name"]: mg["hs"].get(s["name"], 0.0)}}, series) for s in series],
            "wall_kwh": wall_kwh(mg, series), "projection": None}
     if rows and t0 <= now < t1:
         h0 = rows[0][0]
@@ -721,8 +744,14 @@ def cmd_run(args) -> int:
              " (под службой)" if app.supervised else "")
 
     next_flush = time.monotonic() + FLUSH_SECONDS
+    next_hist = time.monotonic() + HISTORY_SECONDS
     try:
         while not app.restart.is_set():
+            if time.monotonic() >= next_hist:
+                app.meter.record()
+                next_hist += HISTORY_SECONDS
+                if next_hist < time.monotonic():
+                    next_hist = time.monotonic() + HISTORY_SECONDS
             if app.changed.wait(1.0):
                 app.changed.clear()
                 if app.restart.is_set():
@@ -800,8 +829,10 @@ h2{font-size:15px;font-weight:600;margin:0 0 8px}
 .card-head h2{margin:0}
 .legend{display:flex;gap:4px 16px;flex-wrap:wrap;font-size:13px}
 #chart{width:100%;height:260px}
-#chart svg{display:block}
-#chart text{font:11px system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+#day-chart{width:100%;height:220px;margin-top:6px}
+#live-chart{width:100%;min-height:180px}
+#chart svg,#day-chart svg,#live-chart svg{display:block}
+#day-chart text,#live-chart text,#chart text{font:11px system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
 .grid{stroke:var(--grid)}
 .axis{stroke:var(--axis)}
 .tick{fill:var(--muted)}
@@ -812,6 +843,12 @@ h2{font-size:15px;font-weight:600;margin:0 0 8px}
 .col.partial .seg{opacity:.55}
 .col:hover .seg,.col:focus .seg{filter:brightness(1.12)}
 .col:focus-visible .hit{stroke:var(--axis)}
+.col.click{cursor:pointer}
+.col.sel .hit{fill:var(--grid);fill-opacity:.6}
+.area{fill-opacity:.22;stroke:none}
+.line{fill:none;stroke-width:1.6;stroke-linejoin:round}
+.guide{stroke:var(--axis);stroke-dasharray:3 3}
+h2.sub-h{margin:16px 0 4px}
 .scroll{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;font-size:13px}
 th,td{padding:5px 8px;text-align:right;border-bottom:1px solid var(--grid);white-space:nowrap}
@@ -857,15 +894,24 @@ input[type=checkbox]{width:auto}
 code{font-size:12px;word-break:break-all}
 """
     + "".join(f".s{i}{{fill:var(--s{i})}}.c{i}{{background:var(--s{i})}}"
-              f".key.k{i}{{border-top-color:var(--s{i})}}" for i in range(N_COLORS)))
+              f".key.k{i}{{border-top-color:var(--s{i})}}.t{i}{{stroke:var(--s{i})}}" for i in range(N_COLORS)))
 
 PAGE_JS = r"""
 (function () {
-  var NC = 8;
-  var dataEl = document.getElementById('month-data');
-  var D = dataEl ? JSON.parse(dataEl.textContent) : null;
-  var box = document.getElementById('chart'), tip = document.getElementById('tip');
-  var NS = 'http://www.w3.org/2000/svg';
+  var NC = 8, NS = 'http://www.w3.org/2000/svg';
+  var tip = document.getElementById('tip');
+  function $(id) { return document.getElementById(id); }
+  function jsonOf(id) { var e = $(id); return e ? JSON.parse(e.textContent) : null; }
+  var D = jsonOf('month-data');
+  // единые цвета хостов на всех графиках
+  var names = D ? D.names.slice() : [], labels = {};
+  if (D) D.names.forEach(function (n, i) { labels[n] = D.channels[i]; });
+  function colorOf(name, label) {
+    var i = names.indexOf(name);
+    if (i < 0) { names.push(name); i = names.length - 1; }
+    if (label) labels[name] = label;
+    return i % NC;
+  }
   function fmt(x, nd) { return x.toLocaleString('ru-RU', {minimumFractionDigits: nd, maximumFractionDigits: nd}); }
   function el(name, attrs, parent) {
     var e = document.createElementNS(NS, name);
@@ -888,112 +934,227 @@ PAGE_JS = r"""
     return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'a' + r + ',' + r + ' 0 0 1 ' + r + ',' + (-r) +
       'H' + (x + w - r) + 'a' + r + ',' + r + ' 0 0 1 ' + r + ',' + r + 'V' + (y + h) + 'Z';
   }
-  function row(val, label, k) {
+
+  // ── всплывашка
+  function tipRow(val, label, k) {
     var r = document.createElement('div'); r.className = 'tip-row';
-    var key = document.createElement('span'); key.className = 'key' + (k === null ? '' : ' k' + (k % NC)); r.appendChild(key);
+    var key = document.createElement('span'); key.className = 'key' + (k === null ? '' : ' k' + k); r.appendChild(key);
     var b = document.createElement('strong'); b.textContent = val; r.appendChild(b);
     var s = document.createElement('span'); s.className = 'lbl'; s.textContent = label; r.appendChild(s);
     return r;
   }
   function hide() { tip.hidden = true; }
-  function show(i, px, py) {
-    var d = D.days[i];
-    if (!(d.total > 0)) { hide(); return; }
+  function showTip(head, rows, foot, px, py) {
     tip.textContent = '';
-    var h = document.createElement('div'); h.className = 'tip-head'; h.textContent = d.date; tip.appendChild(h);
-    tip.appendChild(row(d.total_s + ' ' + D.unit, 'всего', null));
-    for (var k = d.vals.length - 1; k >= 0; k--) if (d.vals[k] > 0) tip.appendChild(row(d.vals_s[k], D.channels[k], k));
-    var f = document.createElement('div'); f.className = 'tip-foot'; f.textContent = d.foot; tip.appendChild(f);
+    var h = document.createElement('div'); h.className = 'tip-head'; h.textContent = head; tip.appendChild(h);
+    rows.forEach(function (r) { tip.appendChild(tipRow(r[0], r[1], r[2])); });
+    if (foot) { var f = document.createElement('div'); f.className = 'tip-foot'; f.textContent = foot; tip.appendChild(f); }
     tip.hidden = false;
     var pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight, left = px + pad, top = py + pad;
     if (left + tw > window.innerWidth - 8) left = px - pad - tw;
     if (top + th > window.innerHeight - 8) top = py - pad - th;
     tip.style.left = Math.max(8, left) + 'px'; tip.style.top = Math.max(8, top) + 'px';
   }
-  function draw() {
-    box.textContent = '';
-    var W = Math.max(320, box.clientWidth), H = 260, m = {t: 24, r: 44, b: 28, l: 48};
-    var pw = W - m.l - m.r, ph = H - m.t - m.b, n = D.days.length;
-    var totals = D.days.map(function (d) { return d.total; });
-    var maxT = Math.max.apply(null, totals), sc = nice(maxT), top = sc.top, nd = decimals(sc.step);
-    function y(v) { return m.t + ph - v / top * ph; }
-    var svg = el('svg', {width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': D.aria}, box);
+  function axisY(svg, m, W, top, sc, y) {
+    var nd = decimals(sc.step);
     for (var v = 0; v <= top + 1e-9; v += sc.step) {
       var yy = Math.round(y(v)) + 0.5;
       el('line', {x1: m.l, x2: W - m.r, y1: yy, y2: yy, 'class': v === 0 ? 'axis' : 'grid'}, svg);
       el('text', {x: m.l - 8, y: yy + 4, 'class': 'tick', 'text-anchor': 'end'}, svg).textContent = fmt(v, nd);
     }
-    var band = pw / n, bw = Math.max(3, Math.min(24, band * 0.62));
-    var maxI = maxT > 0 ? totals.indexOf(maxT) : -1, lastI = -1;
-    D.days.forEach(function (d, i) { if (d.total > 0) lastI = i; });
-    D.days.forEach(function (d, i) {
-      var cx = m.l + band * i + band / 2, x = cx - bw / 2;
-      var g = el('g', {'class': 'col' + (d.today ? ' partial' : '')}, svg);
-      if (d.total > 0) { g.setAttribute('tabindex', '0'); g.setAttribute('aria-label', d.aria); }
-      el('rect', {x: m.l + band * i, y: m.t, width: band, height: ph, 'class': 'hit'}, g);
-      var segs = [], base = 0;
-      d.vals.forEach(function (val, k) { if (val > 0) segs.push([val, k]); });
+  }
+
+  // ── столбики с накоплением: месяц по дням и день по часам
+  // item: {label, segs: [[значение, цвет]], total, total_s, partial, sel, head, rows, foot, aria}
+  function bars(box, items, opt) {
+    box.textContent = '';
+    var W = Math.max(300, box.clientWidth), H = opt.height || 240, m = {t: 22, r: 12, b: 26, l: 48};
+    var pw = W - m.l - m.r, ph = H - m.t - m.b, n = items.length;
+    var totals = items.map(function (d) { return d.total; });
+    var maxT = Math.max.apply(null, totals.concat([0])), sc = nice(maxT), top = sc.top;
+    function y(v) { return m.t + ph - v / top * ph; }
+    var svg = el('svg', {width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': opt.aria}, box);
+    axisY(svg, m, W, top, sc, y);
+    var band = pw / n, bw = Math.max(3, Math.min(24, band * 0.62)), maxI = maxT > 0 ? totals.indexOf(maxT) : -1;
+    items.forEach(function (d, i) {
+      var cx = m.l + band * i + band / 2, x = cx - bw / 2, active = d.total > 0;
+      var g = el('g', {'class': 'col' + (d.partial ? ' partial' : '') + (d.sel ? ' sel' : '') +
+                                 (opt.onPick && active ? ' click' : '')}, svg);
+      if (active) { g.setAttribute('tabindex', '0'); g.setAttribute('aria-label', d.aria); }
+      el('rect', {x: m.l + band * i + 1, y: m.t, width: Math.max(1, band - 2), height: ph, rx: 4, 'class': 'hit'}, g);
+      var base = 0, segs = d.segs.filter(function (s) { return s[0] > 0; });
       segs.forEach(function (s, j) {
         var y0 = y(base), y1 = y(base + s[0]);
         base += s[0];
         var h = y0 - y1 - (j > 0 ? 2 : 0);
         if (h < 1) return;
-        var cls = 'seg s' + (s[1] % NC);
+        var cls = 'seg s' + s[1];
         if (j === segs.length - 1) el('path', {d: colPath(x, y1, bw, h, 4), 'class': cls}, g);
         else el('rect', {x: x, y: y1, width: bw, height: h, 'class': cls}, g);
-        if (i === lastI && h >= 13 && n - i <= 2) {
-          el('text', {x: x + bw + 6, y: y1 + h / 2 + 4, 'class': 'slabel'}, svg).textContent = D.channels[s[1]];
-        }
       });
-      if (i === maxI) {
-        el('text', {x: cx, y: y(d.total) - 7, 'class': 'dlabel', 'text-anchor': 'middle'}, svg).textContent = d.total_s;
+      if (i === maxI) el('text', {x: cx, y: y(d.total) - 7, 'class': 'dlabel', 'text-anchor': 'middle'}, svg).textContent = d.total_s;
+      if (band >= 16 || i % 2 === 0 || d.partial || d.sel) {
+        el('text', {x: cx, y: H - m.b + 17, 'class': 'tick' + (d.partial || d.sel ? ' today' : ''), 'text-anchor': 'middle'}, svg).textContent = d.label;
       }
-      if (band >= 16 || i % 2 === 0 || d.today) {
-        el('text', {x: cx, y: H - m.b + 17, 'class': 'tick' + (d.today ? ' today' : ''), 'text-anchor': 'middle'}, svg).textContent = d.label;
-      }
-      g.addEventListener('pointermove', function (e) { show(i, e.clientX, e.clientY); });
+      if (!active) return;
+      g.addEventListener('pointermove', function (e) { showTip(d.head, d.rows, d.foot, e.clientX, e.clientY); });
       g.addEventListener('pointerleave', hide);
-      g.addEventListener('focus', function () { var r = g.getBoundingClientRect(); show(i, r.left + r.width / 2, r.top + 30); });
+      g.addEventListener('focus', function () { var r = g.getBoundingClientRect(); showTip(d.head, d.rows, d.foot, r.left + r.width / 2, r.top + 30); });
       g.addEventListener('blur', hide);
+      if (opt.onPick) {
+        g.addEventListener('click', function () { opt.onPick(i); });
+        g.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); opt.onPick(i); } });
+      }
     });
   }
-  if (box && D) {
-    draw();
-    var rt;
-    window.addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(draw, 120); });
-  }
+  function onResize(fn) { var t; window.addEventListener('resize', function () { clearTimeout(t); t = setTimeout(fn, 120); }); }
 
-  // ── «сейчас»: строка в шапке и таблица хостов
-  var liveEl = document.getElementById('live'), rowsEl = document.getElementById('live-rows');
+  // ── месяц по дням (клик по дню — показать его по часам)
+  var monthBox = $('chart'), dayBox = $('day-chart'), sel = D ? D.sel : -1;
+  function drawMonth() {
+    if (!monthBox || !D) return;
+    bars(monthBox, D.days.map(function (d, i) {
+      var rows = [[d.total_s + ' ' + D.unit, 'всего', null]];
+      for (var k = d.vals.length - 1; k >= 0; k--) if (d.vals[k] > 0) rows.push([d.vals_s[k], D.channels[k], k % NC]);
+      return {label: d.label, total: d.total, total_s: d.total_s, partial: d.today, sel: i === sel,
+              segs: d.vals.map(function (v, k) { return [v, k % NC]; }),
+              head: d.date, rows: rows, foot: d.foot + ' · клик — по часам', aria: d.aria};
+    }), {height: 260, aria: D.aria, onPick: function (i) { sel = i; drawMonth(); loadDay(D.days[i].iso); }});
+  }
+  var dayData = null;
+  function drawDay() {
+    if (!dayBox || !dayData) return;
+    var j = dayData;
+    $('day-title').textContent = 'По часам: ' + j.title;
+    $('day-sum').textContent = j.summary;
+    bars(dayBox, j.hours.map(function (h) {
+      var segs = [], rows = [], tot = 0;
+      j.order.forEach(function (n) {
+        var v = h.vals[n] || 0, k = colorOf(n, j.labels[n]);
+        segs.push([v, k]); tot += v;
+      });
+      for (var i = j.order.length - 1; i >= 0; i--) {
+        var n = j.order[i], v = h.vals[n] || 0;
+        if (v > 0) rows.push([fmt(v, 0) + ' Вт·ч', j.labels[n], colorOf(n)]);
+      }
+      rows.unshift([fmt(tot, 0) + ' Вт·ч', 'всего', null]);
+      return {label: String(h.h), total: tot, total_s: fmt(tot, 0), partial: h.partial, sel: false, segs: segs,
+              head: h.span + (h.partial ? ' (час ещё идёт)' : ''), rows: rows,
+              foot: 'Вт·ч за час = средняя мощность за этот час, Вт', aria: h.span + ': ' + fmt(tot, 0) + ' Вт·ч'};
+    }), {height: 220, aria: 'Потребление по часам, ' + j.title});
+  }
+  function loadDay(iso) {
+    if (!dayBox) return;
+    fetch('/api/day?date=' + iso, {cache: 'no-store'})
+      .then(function (r) { return r.json(); })
+      .then(function (j) { dayData = j; drawDay(); })
+      .catch(function () { dayBox.textContent = 'не загрузилось'; });
+  }
+  drawMonth();
+  if (D && sel >= 0) loadDay(D.days[sel].iso);
+  onResize(function () { drawMonth(); drawDay(); drawLive(); });
+
+  // ── «сейчас»: строка в шапке, таблица хостов и график последнего часа
+  var liveEl = $('live'), rowsEl = $('live-rows'), liveBox = $('live-chart');
+  var hist = [], lastTs = 0, WINDOW = 3600;
   function wfmt(w) { return w == null ? '—' : Math.round(w) + ' Вт'; }
   function cell(tr, text, cls) {
     var td = document.createElement('td'); if (cls) td.className = cls; td.textContent = text; tr.appendChild(td); return td;
   }
   function renderLive(j) {
     if (liveEl) liveEl.textContent = j.text;
+    if (j.labels) for (var n in j.labels) colorOf(n, j.labels[n]);
+    if (j.history) {
+      j.history.forEach(function (p) { if (p[0] > lastTs) { hist.push(p); lastTs = p[0]; } });
+      var cut = (j.ts || lastTs) - WINDOW;
+      while (hist.length && hist[0][0] < cut) hist.shift();
+      drawLive();
+    }
     if (!rowsEl) return;
     rowsEl.textContent = '';
     j.hosts.forEach(function (h) {
       var tr = document.createElement('tr');
       var td = cell(tr, '', 'l');
+      var sw = document.createElement('span'); sw.className = 'sw c' + colorOf(h.name, h.label); td.appendChild(sw);
       var dot = document.createElement('span'); dot.className = 'dot ' + h.state; td.appendChild(dot);
       td.appendChild(document.createTextNode(h.label));
       j.kinds.forEach(function (k) {
         cell(tr, h.off.indexOf(k) >= 0 ? 'нет (0)' : h.state !== 'ok' ? '—' : h.watts[k] == null ? 'нет сенсора' : wfmt(h.watts[k]));
       });
       cell(tr, h.state === 'ok' ? wfmt(h.sum) : '—');
+      cell(tr, h.state === 'ok' ? wfmt(h.wall) : '—');
       cell(tr, h.note, 'l note');
       rowsEl.appendChild(tr);
     });
   }
-  var liveData = document.getElementById('live-data');
-  if (liveData) renderLive(JSON.parse(liveData.textContent));
-  if (liveEl) setInterval(function () {
-    fetch('/api/live', {cache: 'no-store'})
+  function hhmm(t) { var d = new Date(t * 1000); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+  function drawLive() {
+    if (!liveBox) return;
+    liveBox.textContent = '';
+    if (hist.length < 2) { liveBox.textContent = 'Копится… график появится через несколько секунд.'; liveBox.className = 'note'; return; }
+    liveBox.className = '';
+    var order = names.filter(function (n) { return hist.some(function (p) { return p[1][n] != null; }); });
+    var W = Math.max(300, liveBox.clientWidth), H = 180, m = {t: 14, r: 12, b: 24, l: 48};
+    var t1 = hist[hist.length - 1][0], span = Math.min(WINDOW, Math.max(60, t1 - hist[0][0])), t0 = t1 - span;
+    var step = span <= 180 ? 30 : span <= 600 ? 60 : span <= 1800 ? 300 : 600;
+    $('live-title').textContent = span >= WINDOW ? 'Последний час, Вт' : 'С ' + hhmm(hist[0][0]) + ', Вт';
+    var pw = W - m.l - m.r, ph = H - m.t - m.b;
+    var maxT = 0;
+    hist.forEach(function (p) { var s = 0; order.forEach(function (n) { s += p[1][n] || 0; }); maxT = Math.max(maxT, s); });
+    var sc = nice(maxT), top = sc.top;
+    function x(t) { return m.l + (t - t0) / span * pw; }
+    function y(v) { return m.t + ph - v / top * ph; }
+    var svg = el('svg', {width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Мощность за последний час, Вт'}, liveBox);
+    axisY(svg, m, W, top, sc, y);
+    for (var t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
+      el('text', {x: x(t), y: H - m.b + 16, 'class': 'tick', 'text-anchor': 'middle'}, svg).textContent =
+        step < 60 ? new Date(t * 1000).toLocaleTimeString('ru-RU') : hhmm(t);
+    }
+    // куски без дыр длиннее 30 с, внутри — площади с накоплением
+    var runs = [], run = [];
+    hist.forEach(function (p, i) {
+      if (i && p[0] - hist[i - 1][0] > 30) { runs.push(run); run = []; }
+      run.push(p);
+    });
+    runs.push(run);
+    runs.forEach(function (r) {
+      if (r.length < 2) return;
+      var low = r.map(function () { return 0; });
+      order.forEach(function (n) {
+        var k = colorOf(n), up = r.map(function (p, i) { return low[i] + (p[1][n] || 0); });
+        var dUp = r.map(function (p, i) { return (i ? 'L' : 'M') + x(p[0]).toFixed(1) + ',' + y(up[i]).toFixed(1); }).join('');
+        var dLow = r.map(function (p, i) { return 'L' + x(p[0]).toFixed(1) + ',' + y(low[i]).toFixed(1); }).reverse().join('');
+        el('path', {d: dUp + dLow + 'Z', 'class': 'area s' + k}, svg);
+        el('path', {d: dUp, 'class': 'line t' + k}, svg);
+        low = up;
+      });
+    });
+    var guide = el('line', {y1: m.t, y2: m.t + ph, 'class': 'guide', visibility: 'hidden'}, svg);
+    var hit = el('rect', {x: m.l, y: m.t, width: pw, height: ph, 'class': 'hit'}, svg);
+    hit.addEventListener('pointermove', function (e) {
+      var r = svg.getBoundingClientRect(), t = t0 + (e.clientX - r.left - m.l) / pw * span, best = null;
+      hist.forEach(function (p) { if (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p; });
+      if (!best || Math.abs(best[0] - t) > 30) { hide(); guide.setAttribute('visibility', 'hidden'); return; }
+      guide.setAttribute('x1', x(best[0])); guide.setAttribute('x2', x(best[0])); guide.setAttribute('visibility', 'visible');
+      var rows = [], s = 0;
+      for (var i = order.length - 1; i >= 0; i--) {
+        var v = best[1][order[i]];
+        if (v != null) { rows.push([wfmt(v), labels[order[i]] || order[i], colorOf(order[i])]); s += v; }
+      }
+      rows.unshift([wfmt(s), 'всего CPU+GPU', null]);
+      showTip(new Date(best[0] * 1000).toLocaleTimeString('ru-RU'), rows, null, e.clientX, e.clientY);
+    });
+    hit.addEventListener('pointerleave', function () { hide(); guide.setAttribute('visibility', 'hidden'); });
+  }
+  var liveData = jsonOf('live-data');
+  if (liveData) renderLive(liveData);
+  function poll() {
+    fetch('/api/live?since=' + lastTs, {cache: 'no-store'})
       .then(function (r) { return r.json(); })
       .then(renderLive)
-      .catch(function () { liveEl.textContent = 'логгер не отвечает'; });
-  }, 3000);
+      .catch(function () { if (liveEl) liveEl.textContent = 'логгер не отвечает'; });
+  }
+  if (liveEl) { poll(); setInterval(poll, 3000); }
 })();
 """
 
@@ -1090,6 +1251,55 @@ def month_json(rep: dict) -> dict:
     }
 
 
+def day_report(db, d: date, now: float = None) -> dict:
+    """Один день по часам: Вт·ч каждого хоста за каждый час (= средняя мощность за час)."""
+    now = time.time() if now is None else now
+    t0 = datetime(d.year, d.month, d.day).timestamp()
+    t1 = datetime.combine(d + timedelta(days=1), datetime.min.time()).timestamp()
+    rows = load_rows(db, t0, t1)
+    series = series_list(db, {host_of(r[1]) for r in rows})
+    by_hour = aggregate(rows, lambda h: h)
+    hours, h = [], int(t0)
+    while h < t1:
+        g = by_hour.get(h, EMPTY)
+        start = datetime.fromtimestamp(h)
+        hours.append({"h": start.hour, "span": f"{start:%H}:00–{datetime.fromtimestamp(h + 3600):%H}:00",
+                      "vals": {s["name"]: round(w, 2) for s, w in zip(series, series_wh(g, series)) if w > 0},
+                      "partial": h <= now < h + 3600})
+        h += 3600
+    dg = aggregate(rows, lambda _: 0).get(0, EMPTY)
+    total = sum(series_wh(dg, series))
+    parts = [f"{num(total / 1000, 2)} кВт·ч по датчикам", f"≈ {num(wall_kwh(dg, series), 2)} кВт·ч от розетки",
+             f"{num(dg['secs'] / 3600, 1)} ч с данными"]
+    full = [x for x in hours if not x["partial"] and x["vals"]]
+    if full:
+        peak = max(full, key=lambda x: sum(x["vals"].values()))
+        parts.append(f"самый прожорливый час {peak['span']}: ≈ {num(sum(peak['vals'].values()), 0)} Вт в среднем")
+    return {"date": d.isoformat(),
+            "title": f"{d.day} {MONTHS_GEN[d.month - 1]}, {WEEKDAYS[d.weekday()]}",
+            "order": [s["name"] for s in series], "labels": {s["name"]: s["label"] for s in series},
+            "hours": hours, "total_wh": total, "summary": " · ".join(parts)}
+
+
+def compare_prev(db, y: int, m: int, total_wh: float, now: float = None):
+    """Сравнение с прошлым месяцем; для текущего — за то же число дней от начала месяца."""
+    now = time.time() if now is None else now
+    t0 = datetime(y, m, 1).timestamp()
+    t1 = datetime(*next_month(y, m), 1).timestamp()
+    py_, pm_ = prev_month(y, m)
+    pt0 = datetime(py_, pm_, 1).timestamp()
+    current = t0 <= now < t1
+    pend = min(t0, pt0 + (now - t0)) if current else t0
+    prev = sum(r[2] for r in load_rows(db, pt0, pend))
+    if prev <= 0 or total_wh <= 0:
+        return None
+    pct = (total_wh / prev - 1) * 100
+    arrow = "▲" if pct >= 0.5 else "▼" if pct <= -0.5 else "≈"
+    days = date.today().day
+    span = f" за те же {days} {'день' if days % 10 == 1 and days % 100 != 11 else 'дня' if 2 <= days % 10 <= 4 and not 12 <= days % 100 <= 14 else 'дней'}" if current else ""
+    return f"{arrow} {num(abs(pct), 0)} % к {MONTHS_DAT[pm_ - 1]}{span}"
+
+
 def render_month(db, y: int, m: int, live: dict) -> str:
     e = html.escape
     rep = month_report(db, y, m)
@@ -1098,23 +1308,25 @@ def render_month(db, y: int, m: int, live: dict) -> str:
     title = month_title(y, m)
     (py_, pm_), (ny_, nm_) = prev_month(y, m), next_month(y, m)
 
-    days_js = []
-    for d in rep["days"]:
+    days_js, sel = [], -1
+    for i, d in enumerate(rep["days"]):
         tot, dd = sum(d["wh"]), d["date"]
+        if d["today"] or (d["has"] and not any(x["today"] for x in rep["days"])):
+            sel = i  # день «по часам»: сегодня, а в прошлых месяцах — последний день с данными
         date_s = f"{dd.day} {MONTHS_GEN[dd.month - 1]}, {WEEKDAYS[dd.weekday()]}"
         vals_s = [num(w / 1000, 2) for w in d["wh"]]
         foot = f"ср. {num(avg_w(tot, d['secs']), 0)} Вт · {num(d['secs'] / 3600, 1)} ч с данными"
         if d["today"]:
             foot += " · день ещё идёт"
         days_js.append({
-            "label": str(dd.day), "date": date_s, "today": d["today"],
+            "label": str(dd.day), "date": date_s, "iso": dd.isoformat(), "today": d["today"],
             "vals": [round(w / 1000, 4) for w in d["wh"]], "vals_s": vals_s,
             "total": round(tot / 1000, 4), "total_s": num(tot / 1000, 2), "foot": foot,
             "aria": f"{date_s}: всего {num(tot / 1000, 2)} кВт·ч, "
                     + ", ".join(f"{c} {v}" for c, v in zip(labels, vals_s)),
         })
-    data = {"unit": "кВт·ч", "channels": labels, "aria": f"Потребление по дням, {title}, кВт·ч",
-            "days": days_js}
+    data = {"unit": "кВт·ч", "channels": labels, "names": [s["name"] for s in rep["series"]],
+            "aria": f"Потребление по дням, {title}, кВт·ч", "days": days_js, "sel": sel}
 
     def tile(label, value, note, sw=None):
         swh = f'<span class="sw c{sw % N_COLORS}"></span>' if sw is not None else ""
@@ -1124,7 +1336,10 @@ def render_month(db, y: int, m: int, live: dict) -> str:
     tiles = []
     for i, s in enumerate(rep["series"]):
         kinds = " · ".join(f"{k} {num(v / 1000, 2)}" for k, v in sorted(rep["kind_wh"][i].items()))
-        note = (kinds + " · " if kinds else "") + f"ср. {num(avg_w(rep['wh'][i], rep['hsecs'][i]), 0)} Вт"
+        share = f"{num(rep['wh'][i] / rep['total_wh'] * 100, 0)} % от всех · " if rep["total_wh"] > 0 else ""
+        note = ((kinds + "<br>" if kinds else "") + share
+                + f"ср. {num(avg_w(rep['wh'][i], rep['hsecs'][i]), 0)} Вт за {num(rep['hsecs'][i] / 3600, 0)} ч"
+                + f"<br>≈ {num(rep['hwall'][i] * TARIFF, 0)} {e(CURRENCY)} от розетки")
         tiles.append(tile(s["label"], f'{num(rep["wh"][i] / 1000, 2)}<span class="u"> кВт·ч</span>', note, sw=i))
     tiles.append(tile("≈ от розетки", f'{num(rep["wall_kwh"], 1)}<span class="u"> кВт·ч</span>',
                       "+ прочее железо и КПД БП каждого хоста"))
@@ -1133,7 +1348,8 @@ def render_month(db, y: int, m: int, live: dict) -> str:
     if rep["projection"]:
         p = rep["projection"]
         tiles.append(tile("Прогноз на месяц", f'≈ {num(p["total_kwh"], 0)}<span class="u"> кВт·ч</span>',
-                          f'≈ {num(p["wall_kwh"] * TARIFF, 0)} {e(CURRENCY)} от розетки, если дальше так же'))
+                          f'≈ {num(p["wall_kwh"], 0)} кВт·ч ≈ {num(p["wall_kwh"] * TARIFF, 0)} {e(CURRENCY)} '
+                          'от розетки, если дальше так же'))
 
     legend = "".join(f'<span><span class="sw c{i % N_COLORS}"></span>{e(c)}</span>' for i, c in enumerate(labels))
 
@@ -1174,8 +1390,11 @@ def render_month(db, y: int, m: int, live: dict) -> str:
     live_card = ('<section class="card"><div class="card-head"><h2>Сейчас</h2>'
                  '<a class="note" href="/hosts">настроить хосты</a></div><div class="scroll"><table>'
                  '<thead><tr><th>Хост</th>' + "".join(f"<th>{k}</th>" for k in KINDS)
-                 + '<th>Сумма</th><th class="l">Железо / статус</th></tr></thead>'
-                 '<tbody id="live-rows"></tbody></table></div></section>')
+                 + '<th>CPU+GPU</th><th>≈ от розетки</th><th class="l">Железо / статус</th></tr></thead>'
+                 '<tbody id="live-rows"></tbody></table></div>'
+                 '<h2 class="sub-h" id="live-title">Последний час, Вт</h2><div id="live-chart"></div>'
+                 '<p class="note">Только CPU+GPU по датчикам. История в памяти логгера — после перезапуска '
+                 'копится заново.</p></section>')
 
     footer = ("«≈ от розетки» = по каждому хосту (CPU + GPU + прочее железо) / КПД блока питания — "
               "оценка, без монитора; «прочее» и КПД задаются на странице хостов. "
@@ -1184,8 +1403,14 @@ def render_month(db, y: int, m: int, live: dict) -> str:
     nav_prev = f'<a class="nav" href="/?month={py_}-{pm_:02d}">‹ {MONTHS[pm_ - 1]}</a>'
     nav_next = (f'<a class="nav" href="/?month={ny_}-{nm_:02d}">{MONTHS[nm_ - 1]} ›</a>'
                 if datetime(ny_, nm_, 1) <= datetime.now() else '<span class="nav off">—</span>')
-    chart = ('<div id="chart"></div>' if rep["secs"] > 0
-             else '<div class="empty">Нет данных за этот месяц</div>')
+    has_data = rep["secs"] > 0
+    chart = '<div id="chart"></div>' if has_data else '<div class="empty">Нет данных за этот месяц</div>'
+    day_card = ('<section class="card"><div class="card-head"><h2 id="day-title">По часам</h2>'
+                '<div class="legend">' + legend + '</div></div>'
+                '<div class="note" id="day-sum"></div><div id="day-chart"></div>'
+                '<p class="note">Вт·ч за час = средняя мощность за этот час. '
+                'Другой день — клик по столбику на графике выше.</p></section>') if has_data else ""
+    cmp = compare_prev(db, y, m, rep["total_wh"])
     body = (
         f'<div class="bar">{nav_prev}<h1>{e(title)}</h1>{nav_next}'
         f'<span class="live" id="live">{e(live["text"])}</span>'
@@ -1193,12 +1418,14 @@ def render_month(db, y: int, m: int, live: dict) -> str:
         '<section class="card hero"><div class="label">CPU + GPU за месяц, все хосты</div>'
         f'<div class="value">{num(rep["total_wh"] / 1000, 2 if rep["total_wh"] < 10000 else 1)}'
         '<span class="unit"> кВт·ч</span></div>'
-        f'<div class="sub">по датчикам LHM · {num(rep["secs"] / 3600, 0)} ч с данными</div></section>'
+        f'<div class="sub">по датчикам LHM · {num(rep["secs"] / 3600, 0)} ч с данными'
+        + (f' · {e(cmp)}' if cmp else "") + '</div></section>'
         f'<section class="tiles">{"".join(tiles)}</section>'
         f'{live_card}'
         f'<section class="card"><div class="card-head"><h2>По дням, кВт·ч</h2>'
         f'<div class="legend">{legend}</div></div>{chart}'
         f'<details><summary>Таблица по дням</summary>{day_table}</details></section>'
+        f'{day_card}'
         f'<section class="card"><h2>По месяцам</h2>{months_table}</section>'
         f'<footer>{footer}</footer>'
         '<div id="tip" class="tip" hidden></div>'
@@ -1474,7 +1701,14 @@ def start_web(app: App, host: str, port: int):
             q = urllib.parse.parse_qs(u.query)
             try:
                 if u.path == "/api/live":
-                    self._json(app.meter.snapshot())
+                    snap = app.meter.snapshot()
+                    if "since" in q:
+                        try:
+                            since = float(q["since"][0])
+                        except ValueError:
+                            since = 0.0
+                        snap["history"] = app.meter.history_since(since)
+                    self._json(snap)
                     return
                 db = app.connect()
                 try:
@@ -1490,6 +1724,12 @@ def start_web(app: App, host: str, port: int):
                         notice = f"Сохранено: «{saved}». Логгер уже опрашивает по-новому." if saved else None
                         self._send(200, render_hosts(db, app.meter.snapshot(), edit=edit, notice=notice,
                                                      app=app), "text/html")
+                    elif u.path == "/api/day":
+                        try:
+                            d = date.fromisoformat(q.get("date", [""])[0])
+                        except ValueError:
+                            d = date.today()
+                        self._json(day_report(db, d))
                     elif u.path == "/api/hosts":
                         self._json([{k: v for k, v in h.items() if k != "password"} for h in load_hosts(db)])
                     else:
@@ -1576,8 +1816,15 @@ def start_web(app: App, host: str, port: int):
         log.warning("страничка не запустилась на %s:%s (%s) — логгер работает без неё", host, port, ex)
         return None
     threading.Thread(target=srv.serve_forever, name="web", daemon=True).start()
-    shown = "127.0.0.1" if host in ("", "0.0.0.0") else host
-    log.info("страничка: http://%s:%s/  (хосты: /hosts)", shown, port)
+    if host in ("", "0.0.0.0"):
+        try:
+            ips = sorted({i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)})
+        except OSError:
+            ips = []
+        shown = ", ".join(f"http://{ip}:{port}/" for ip in ["127.0.0.1"] + ips)
+    else:
+        shown = f"http://{host}:{port}/"
+    log.info("страничка: %s (хосты: /hosts)", shown)
     return srv
 
 
